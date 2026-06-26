@@ -26,6 +26,92 @@ from .client import NotionStream
 SCHEMAS_DIR = resources.files(__package__) / "schemas"
 
 
+class _LastEditedIncremental:
+    """Mixin: incremental sync on Notion's ``last_edited_time``.
+
+    The cutoff is the Singer state bookmark, falling back to the configured
+    ``start_date``. Endpoints that mix this in must sort results newest-first so
+    pagination can stop as soon as a page contains rows older than the cutoff.
+
+    This mirrors the incremental logic used by :class:`SearchStream`; it lives in a
+    standalone mixin so streams can reuse it WITHOUT inheriting SearchStream's
+    page-oriented child-context behavior. (Consolidating SearchStream onto this
+    mixin is a possible future cleanup.)
+    """
+
+    @staticmethod
+    def _parse_iso8601(timestamp: str):
+        """Parse an ISO 8601 string into a UTC-aware datetime (date-only allowed)."""
+        timestamp_str = timestamp.strip()
+        if len(timestamp_str) == 10 and "T" not in timestamp_str:
+            date_obj = datetime.date.fromisoformat(timestamp_str)
+            return datetime.datetime(
+                date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc
+            )
+        if timestamp_str.endswith("Z"):
+            timestamp_str = timestamp_str[:-1] + "+00:00"
+        parsed = datetime.datetime.fromisoformat(timestamp_str)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
+
+    def _config_start_date(self):
+        """Parse the configured ``start_date``, or None if unset/invalid."""
+        value = self.config.get("start_date")
+        if not value:
+            return None
+        try:
+            return self._parse_iso8601(value)
+        except Exception:
+            return None
+
+    def _effective_cutoff(self, context):
+        """State bookmark if present, otherwise the configured ``start_date``."""
+        try:
+            bookmark = self.get_starting_timestamp(context)  # type: ignore[attr-defined]
+        except Exception:
+            bookmark = None
+        return bookmark or self._config_start_date()
+
+    def get_next_page_token(self, response, previous_token):  # type: ignore[override]
+        """Stop paginating once a page (sorted newest-first) drops below the cutoff."""
+        next_cursor = (response.json() or {}).get("next_cursor")
+        cutoff = self._effective_cutoff(context=None)
+        if not cutoff or not next_cursor:
+            return next_cursor
+        oldest = None
+        for record in (response.json() or {}).get("results", []):
+            ts = record.get("last_edited_time")
+            if not ts:
+                continue
+            try:
+                parsed = self._parse_iso8601(ts)
+            except Exception:
+                continue
+            if oldest is None or parsed < oldest:
+                oldest = parsed
+        if oldest is not None and oldest < cutoff:
+            return None
+        return next_cursor
+
+    def post_process(self, row: dict, context: dict | None = None) -> dict | None:
+        """Record-level safety net: drop rows older than the cutoff."""
+        row = super().post_process(row, context)
+        if row is None:
+            return None
+        cutoff = self._effective_cutoff(context)
+        if not cutoff:
+            return row
+        ts = row.get("last_edited_time")
+        if ts:
+            try:
+                if self._parse_iso8601(ts) < cutoff:
+                    return None
+            except Exception:
+                return row
+        return row
+
+
 class UsersStream(NotionStream):
     """Notion users stream (GET /v1/users).
 
@@ -822,3 +908,127 @@ class BlockChildrenStream(NotionStream):
             # Exit pagination loop if no more pages exist (next_cursor is None/empty)
             if not pagination_cursor:
                 break
+
+
+class DatabaseRowsStream(_LastEditedIncremental, NotionStream):
+    """Rows of specific Notion databases (POST /v1/databases/{database_id}/query).
+
+    In Notion a database *row* is a page, so each record is a page object whose
+    column values live under ``properties``. The set of databases to pull is taken
+    from the ``database_ids`` config list; one Singer partition is created per id so
+    incremental state (``last_edited_time``) is tracked independently per database.
+    """
+
+    name = "database_rows"
+    # {database_id} is filled per-partition from the context below.
+    path = "/databases/{database_id}/query"
+    primary_keys: t.ClassVar[list[str]] = ["id"]
+    replication_key = "last_edited_time"
+    rest_method = "POST"
+
+    schema = th.PropertiesList(
+        th.Property("object", th.StringType),
+        th.Property("id", th.StringType),
+        th.Property("url", th.StringType),
+        th.Property("created_time", th.DateTimeType),
+        th.Property("last_edited_time", th.DateTimeType),
+        th.Property("archived", th.BooleanType),
+        # Column values of the row (untyped object; parse downstream).
+        th.Property("properties", th.ObjectType()),
+        th.Property("parent", th.ObjectType()),
+        # Which configured database this row was pulled from.
+        th.Property("database_id", th.StringType),
+    ).to_dict()
+
+    @property
+    def partitions(self) -> list[dict] | None:
+        """One partition per configured database id (per-database incremental state)."""
+        database_ids = self.config.get("database_ids") or []
+        return [{"database_id": db_id} for db_id in database_ids]
+
+    def prepare_request_payload(
+        self,
+        context: dict | None,
+        next_page_token: t.Any | None,
+    ) -> dict | None:
+        """Compose the POST body for /databases/{id}/query.
+
+        Sorts newest-first by last_edited_time (so the mixin's early-termination
+        works) and, when a cutoff exists, filters server-side to rows edited on or
+        after it. Note Notion's query endpoint uses ``sorts`` (a list) — unlike the
+        ``sort`` (singular) used by /search.
+        """
+        payload: dict[str, t.Any] = {}
+
+        if next_page_token:
+            payload["start_cursor"] = next_page_token
+
+        payload["page_size"] = self.config.get("page_size") or 100
+        payload["sorts"] = [
+            {"timestamp": "last_edited_time", "direction": "descending"},
+        ]
+
+        cutoff = self._effective_cutoff(context)
+        if cutoff:
+            payload["filter"] = {
+                "timestamp": "last_edited_time",
+                "last_edited_time": {"on_or_after": cutoff.isoformat()},
+            }
+
+        return payload
+
+    def post_process(self, row: dict, context: dict | None = None) -> dict | None:
+        """Apply the incremental cutoff filter (mixin), then tag the source db."""
+        row = super().post_process(row, context)
+        if row is not None and context and context.get("database_id"):
+            row["database_id"] = context["database_id"]
+        return row
+
+
+class DatabaseSchemaStream(NotionStream):
+    """Schema/metadata of specific Notion databases (GET /v1/databases/{database_id}).
+
+    One record per configured database id: the database's title and its property
+    DEFINITIONS (column names, types, select options) under ``properties`` — the
+    counterpart to ``database_rows`` (which carries the column VALUES). Use it to
+    interpret/flatten the row ``properties`` downstream. Full refresh each run
+    (the schema is a current snapshot, not time-series).
+    """
+
+    name = "databases"
+    path = "/databases/{database_id}"
+    primary_keys: t.ClassVar[list[str]] = ["id"]
+    # GET returns a single database object (not a {"results": [...]} envelope).
+    records_jsonpath = "$"
+
+    schema = th.PropertiesList(
+        th.Property("object", th.StringType),
+        th.Property("id", th.StringType),
+        th.Property("url", th.StringType),
+        th.Property("created_time", th.DateTimeType),
+        th.Property("last_edited_time", th.DateTimeType),
+        th.Property("archived", th.BooleanType),
+        # Database title (Notion rich-text array).
+        th.Property("title", th.ArrayType(th.ObjectType())),
+        # Column DEFINITIONS (name -> {type, options, ...}); parse downstream.
+        th.Property("properties", th.ObjectType()),
+        th.Property("parent", th.ObjectType()),
+        th.Property("database_id", th.StringType),
+    ).to_dict()
+
+    @property
+    def partitions(self) -> list[dict] | None:
+        """One partition per configured database id."""
+        database_ids = self.config.get("database_ids") or []
+        return [{"database_id": db_id} for db_id in database_ids]
+
+    def get_url_params(self, context: dict | None, next_page_token: t.Any | None) -> dict:
+        """No query params: this is a single-object GET (no pagination/page_size)."""
+        return {}
+
+    def post_process(self, row: dict, context: dict | None = None) -> dict | None:
+        """Tag each schema record with the database id it came from."""
+        row = super().post_process(row, context)
+        if row is not None and context and context.get("database_id"):
+            row["database_id"] = context["database_id"]
+        return row

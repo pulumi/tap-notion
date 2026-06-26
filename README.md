@@ -47,6 +47,8 @@ Key settings used by this tap:
   - Adds a simple object filter to /search: "page" or "database".
 - search_query (optional)
   - Adds a query string to /search requests.
+- database_ids (optional)
+  - List of Notion database ids to pull via the `database_rows` and `databases` streams. One Singer partition is created per id, so incremental state is tracked independently per database.
 - start_date (optional)
   - Initial cutoff for incremental sync on the search stream only. The tap sorts search results by last_edited_time (newest first) and filters client-side to drop rows older than this timestamp. On subsequent runs, Singer state supersedes start_date.
 
@@ -102,6 +104,8 @@ New to Meltano or Singer? Start with ARCHITECTURE.md for a friendly overview of 
 - pages (GET /v1/pages/{page_id}) — page metadata for each page context
 - page_blocks (GET /v1/blocks/{page_id}/children) — top-level blocks for each page
 - block_children — recursively traverse all blocks for each page
+- database_rows (POST /v1/databases/{database_id}/query) — rows of the configured `database_ids`, each as a page object whose column values live under `properties`; incremental per database on last_edited_time
+- databases (GET /v1/databases/{database_id}) — schema/metadata of the configured `database_ids` (column definitions, types and select options)
 
 ## Developer Resources
 
