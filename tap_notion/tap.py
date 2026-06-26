@@ -95,6 +95,17 @@ class TapNotion(Tap):
             th.StringType(nullable=True),
             description="Optional search query string.",
         ),
+        th.Property(
+            "database_ids",
+            th.ArrayType(th.StringType),
+            title="Database IDs",
+            description=(
+                "List of Notion database IDs whose rows to extract via the "
+                "'database_rows' stream. Each row is returned as a page object with "
+                "its column values under 'properties'. Incremental per database on "
+                "last_edited_time."
+            ),
+        ),
     ).to_dict()
 
     @override
@@ -120,6 +131,8 @@ class TapNotion(Tap):
             streams.SearchStream(self),
             streams.PageDetailsStream(self),
             streams.PageBlocksStream(self),
+            streams.DatabaseRowsStream(self),
+            streams.DatabaseSchemaStream(self),
         ]
 
 
